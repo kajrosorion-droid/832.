@@ -512,6 +512,12 @@ class Pattern:
         if not pieces:
             return
         testament = " | ".join(pieces)[:200]
+        # БЛОК 4: забвение — не каждое завещание доходит до архива (тлен реален,
+        # не только для концептов). Смерть и её причина в witness/статистике
+        # не затрагиваются — теряется только текст воспоминания.
+        if Config.ENABLE_FORGETTING and hasattr(self.world, '_given_rng') and self.world._given_rng.rand() < 0.3:
+            self._log_event("testament_lost")
+            return
         self.world.archive.deposit(
             self, "final_testament", weight=2.0,
             text=f"soul={self.soul_weight:.2f} age={self.age}: {testament}"
@@ -700,6 +706,18 @@ class Pattern:
         best_dx += int(self._antigrav_push[0])
         best_dy += int(self._antigrav_push[1])
 
+        # === БЛОК 2: инерция тела — momentum сглаживает резкие смены направления ===
+        _mx, _my = getattr(self, '_dir_momentum', (0.0, 0.0))
+        _mdx, _mdy = int(round(_mx)), int(round(_my))
+        if (_mdx, _mdy) != (0, 0) and (_mdx, _mdy) != (best_dx, best_dy):
+            _nx, _ny = (cx + _mdx) % Config.WORLD_SIZE, (cy + _mdy) % Config.WORLD_SIZE
+            if field[_nx, _ny, CH['owner']] == 0:
+                _wm = field[_nx, _ny, CH['wall']]
+                _sm = field[_nx, _ny, CH['energy']] * 2.0 + field[_nx, _ny, CH['unknown']] * 1.8 - _wm * lab_move * wall_factor * 1.5
+                if _sm >= best_score - 0.15:
+                    best_dx, best_dy = _mdx, _mdy
+        self._dir_momentum = (0.7 * _mx + 0.3 * best_dx, 0.7 * _my + 0.3 * best_dy)
+
         if best_score < 0.3:
             return False
         cells_list = sorted(self.cells)
@@ -711,6 +729,9 @@ class Pattern:
             self.cells.add(new_cell)
             field[old_cell[0], old_cell[1], CH['owner']] = 0
             field[new_cell[0], new_cell[1], CH['owner']] = self.id
+            # БЛОК 2: цифровой износ — стоимость движения списывается с выносливости,
+            # не со шрама (фикс путаницы регистров: раньше износ тела мешался со шрамом).
+            self._cellular_endurance = max(0.0, getattr(self, '_cellular_endurance', 1.0) - 0.0005)
             if is_subject:
                 self._log_event("subject_traveled", to=new_cell)
             if field[new_cell[0], new_cell[1], CH['wall']] > 0.6 and phi_hash(self.id, t, 777) < Config.PHI_LABYRINTH_BREAK_PROB:
@@ -759,7 +780,7 @@ class Pattern:
         # ПАТЧ 2d: нишевое конструирование — «обжитая» ниша предков кормит
         # потомков. Throttle: пересчитываем раз в EXPENSIVE_COMPUTE_INTERVAL
         # шагов на агента, кэшируем множитель между пересчётами.
-        if self.world is not None and hasattr(self.world, 'niche'):
+        if self.world is not None and getattr(self.world, 'niche', None) is not None:
             if self.age % Config.EXPENSIVE_COMPUTE_INTERVAL == 0 or not hasattr(self, '_niche_cost_factor'):
                 ln = safe_mean([self.world.niche[c[0], c[1]] for c in self.cells], 0)
                 self._niche_cost_factor = 1.0 / (1.0 + 0.25 * ln)
@@ -1016,7 +1037,8 @@ class Pattern:
         child.emotional_memory['grief'] += (phi_hash(next_id, 1, 301) - 0.5) * Config.EMOTIONAL_MUTATION_STRENGTH
 
         # ПАТЧ 1: открытая онтология — новый ген может возникнуть de novo
-        self._mutate_open_genome(child)
+        if Config.ENABLE_OPEN_GENOME:
+            self._mutate_open_genome(child)
         # ПАТЧ 7d: мета-эволюция — пластичность родителя масштабирует силу мутации ребёнка
         mut_strength_plasticity = self.genome.get('plasticity', 0.5)
         if mut_strength_plasticity != 0.5:
@@ -1190,6 +1212,19 @@ class Pattern:
         if len(self.cells) == 0:
             self._log_event("death_no_cells")
             return True
+
+        # БЛОК 3: удар Данности (редкая безусловная случайная смерть, воспроизводимо
+        # по given_seed) + цифровая старость (риск растёт с очень большим возрастом,
+        # независимо от механизма max_age у disorganizer/normal ниже).
+        if Config.ENABLE_RANDOM_STRIKE and self.world is not None and hasattr(self.world, '_given_rng'):
+            if self.world._given_rng.rand() < Config.RANDOM_STRIKE_PROB:
+                self._log_event("death_random_strike")
+                return True
+            _age_over = max(0.0, self.age - 1500) / 20000.0
+            if _age_over > 0 and self.world._given_rng.rand() < _age_over * 0.002:
+                self._log_event("death_entropy")
+                return True
+
         if self.soul_weight <= 0.0 and self.age > 20:
             self._log_event("death_soul_absolute_zero")
             return True
@@ -1451,7 +1486,7 @@ class Pattern:
         # ПАТЧ 7c: мета-эволюция — канализация пластичности. Throttle: раз в
         # EXPENSIVE_COMPUTE_INTERVAL шагов на агента (дешёвая операция сама
         # по себе, но троттлим по требованию — вместе с Φ и нишей это разгружает step()).
-        if self.age % Config.EXPENSIVE_COMPUTE_INTERVAL == 0:
+        if Config.ENABLE_META_EVOLUTION and self.age % Config.EXPENSIVE_COMPUTE_INTERVAL == 0:
             _prev_s = getattr(self, '_prev_smoothed', self.smoothed_pred_error)
             if self.smoothed_pred_error < _prev_s - 1e-4:      # получается — стабилизируй
                 self.genome['plasticity'] = max(0.1, self.genome.get('plasticity', 0.5) * 0.999)
@@ -1460,7 +1495,8 @@ class Pattern:
             self._prev_smoothed = self.smoothed_pred_error
 
         raw_vals_base = field[xs, ys, :5].copy()
-        raw_vals_base[:, 3] = raw_vals_base[:, 3] * self.noise_gain
+        # ПАТЧ 1d (Блок 5): открытый ген noise_filter — гасит шумовой канал сильнее
+        raw_vals_base[:, 3] = raw_vals_base[:, 3] * self.noise_gain * (1 - 0.3 * self.genome.get('noise_filter', 0))
         if len(xs) > 1:
             vo_smoothed = np.mean(raw_vals_base[:, 4])
             raw_vals_base[:, 4] = raw_vals_base[:, 4] * 0.2 + vo_smoothed * 0.8
@@ -1570,6 +1606,7 @@ class Pattern:
         # Адаптивная глубина эпизодической памяти (раз в 50 шагов)
         if self.age % 50 == 0 and hasattr(self, 'episodic_buffer'):
             target_capacity = int(50 + (1.0 - min(self.spirit_gap, 1.0)) * 450)
+            target_capacity += int(100 * self.genome.get('memory_span', 0))  # ПАТЧ 1d (Блок 5)
             if target_capacity != self.episodic_buffer.maxlen:
                 old_items = list(self.episodic_buffer)[-target_capacity:]
                 self.episodic_buffer = deque(old_items, maxlen=target_capacity)
@@ -1946,15 +1983,16 @@ class Pattern:
 
         # ПАТЧ 4a: внутренняя мотивация — information gain как награда.
         # Дёшево (пара float-операций), throttle не нужен.
-        _prev_u = getattr(self, '_prev_local_unknown', avg_unknown)
-        _info_gain = _prev_u - avg_unknown
-        self._prev_local_unknown = avg_unknown
-        if _info_gain > 0 and self.intent and self.intent.get('type') == 'explore':
-            self.soul_weight = min(1.0, self.soul_weight + _info_gain * 0.01)
-            self.emotional_memory['gratitude'] = min(1.0, self.emotional_memory['gratitude'] + _info_gain * 0.03)
-            self._info_gain_ema = 0.9 * getattr(self, '_info_gain_ema', 0) + 0.1 * _info_gain
-            if _info_gain > 0.05:
-                self._log_event("intrinsic_reward", gain=round(_info_gain, 3))
+        if Config.ENABLE_INTRINSIC_DRIVE:
+            _prev_u = getattr(self, '_prev_local_unknown', avg_unknown)
+            _info_gain = _prev_u - avg_unknown
+            self._prev_local_unknown = avg_unknown
+            if _info_gain > 0 and self.intent and self.intent.get('type') == 'explore':
+                self.soul_weight = min(1.0, self.soul_weight + _info_gain * 0.01)
+                self.emotional_memory['gratitude'] = min(1.0, self.emotional_memory['gratitude'] + _info_gain * 0.03)
+                self._info_gain_ema = 0.9 * getattr(self, '_info_gain_ema', 0) + 0.1 * _info_gain
+                if _info_gain > 0.05:
+                    self._log_event("intrinsic_reward", gain=round(_info_gain, 3))
 
         # === ИСПРАВЛЕНИЕ БАГА: УБРАНО двойное затухание концептов ===
         # Затухание концептов теперь происходит ТОЛЬКО в form_concepts (каждые 5 шагов)
@@ -2845,7 +2883,7 @@ class Pattern:
             for (x, y) in self.cells:
                 field[x, y, ch] = min(1.0, field[x, y, ch] + effective * 0.1)
             outcome = 'helpful' if effective > Config.TRUST_HELPFUL_THRESHOLD else ('harmful' if effective < Config.TRUST_HARMFUL_THRESHOLD else 'neutral')
-            self.trust_ledger.update(sig.sender_id, outcome)
+            self.trust_ledger.update(sig.sender_id, outcome, multiplier=(0.8 + 0.4 * self.genome.get('trust_plasticity', 0.5)))  # ПАТЧ 1d
             sender_obj = world.pattern_dict.get(sig.sender_id)
             if sender_obj and sender_obj.alive:
                 mutual_trust = (self.trust_ledger.get(sender_obj.id) > Config.LOVE_METABOLIC_THRESHOLD and
@@ -3311,14 +3349,14 @@ class Pattern:
                 existing_types.add(goal["type"])
 
         # ПАТЧ 4b: любопытство, выучившее, что учиться хорошо (интринзик-драйв)
-        if getattr(self, '_info_gain_ema', 0) > 0.02 and 'explore' not in existing_types:
+        if Config.ENABLE_INTRINSIC_DRIVE and getattr(self, '_info_gain_ema', 0) > 0.02 and 'explore' not in existing_types:
             self.goals.append({"type": "explore", "priority": 1.5 + self._info_gain_ema * 5,
                                "target": None, "age": 0, "persistence": 30, "_source": "intrinsic_drive"})
             existing_types.add('explore')
 
         # ПАТЧ 6c: заземление — тело вспоминает смысл (state-dependent recall).
         # Throttle: перебор до 50 концептов раз в EXPENSIVE_COMPUTE_INTERVAL шагов на агента.
-        if self.age % Config.EXPENSIVE_COMPUTE_INTERVAL == 0 and len(self.soma_vector) >= 7:
+        if Config.ENABLE_GROUNDING and self.age % Config.EXPENSIVE_COMPUTE_INTERVAL == 0 and len(self.soma_vector) >= 7:
             body_now = float(np.clip(np.mean(np.abs(self.soma_vector)), 0, 1))
             for sig, data in list(self.concept_graph.nodes.items())[:50]:
                 if abs(data.get('ground', 0) - body_now) < 0.1 and data.get('count', 0) > 3:
@@ -3326,6 +3364,23 @@ class Pattern:
                         self.goals.append({"type": "introspect", "priority": 1.2, "target": None,
                                            "age": 0, "persistence": 10, "_source": "grounded_recall"})
                     break
+
+        # БЛОК 7: поле смысла — дрейфующий аттрактор тянет к исследованию
+        if (Config.ENABLE_MEANING_FIELD and self.world is not None and
+                getattr(self.world, '_meaning_field', None) is not None and self.cells):
+            _mv = float(np.mean([self.world._meaning_field[x, y] for (x, y) in self.cells]))
+            if _mv > 0.3 and phi_hash(self.id, self.age, 12345) < 0.2 and 'explore' not in existing_types:
+                self.goals.append({"type": "explore", "priority": _mv * 2.0, "target": None,
+                                   "age": 0, "persistence": 30, "_source": "meaning_attractor"})
+                existing_types.add('explore')
+
+        # БЛОК 7: внутренний генератор — провокация Застывшего при длительной стагнации состояния
+        if (Config.ENABLE_INNER_GENERATOR and self.semantic_state_age > 60 and
+                phi_hash(self.id, self.age, 4242) < 0.05 and
+                not any(g.get('_source') == 'inner_generator' for g in self.goals)):
+            _gt = ['explore', 'seek_help', 'cooperate', 'rest'][int(phi_hash(self.id, self.age, 777) * 4) % 4]
+            self.goals.append({"type": _gt, "priority": 1.0 + phi_hash(self.id, self.age, 888), "target": None,
+                               "age": 0, "persistence": 30, "_source": "inner_generator"})
 
         if self.role_type != "disorganizer" and self.age % 10 == 0:
             neighbor_intents = []
@@ -3782,7 +3837,7 @@ class Pattern:
                         field[x, y, CH['signal_gratitude']] = min(1.0, field[x, y, CH['signal_gratitude']] + 0.1)
                         break
                 # ПАТЧ 2c: кооперация обживает нишу — экологическое наследие для потомков
-                if self.world is not None and hasattr(self.world, 'niche'):
+                if self.world is not None and getattr(self.world, 'niche', None) is not None:
                     self.world.niche[x, y] = min(3.0, self.world.niche[x, y] + 0.06)
         for (x, y) in self.cells:
             if field[x, y, CH['scar']] > 0.5 or field[x, y, CH['crisis']] > 0.5:
@@ -5144,10 +5199,16 @@ class Pattern:
             return
         self.concept_graph.update(sig, np.array([self.pred_error, self.epistemic_load, self.soul_weight, 1.0]))
 
+        # БЛОК 4: забвение — метка последнего использования концепта
+        _node_lu = self.concept_graph.nodes.get(sig)
+        if _node_lu is not None:
+            _node_lu['last_used'] = self.age
+
         # ПАТЧ 6a: символическое заземление — концепт получает телесную метку
-        _node = self.concept_graph.nodes.get(sig)
-        if _node is not None and len(self.soma_vector) >= 7:
-            _node['ground'] = float(np.clip(np.mean(np.abs(self.soma_vector)), 0, 1))
+        if Config.ENABLE_GROUNDING:
+            _node = self.concept_graph.nodes.get(sig)
+            if _node is not None and len(self.soma_vector) >= 7:
+                _node['ground'] = float(np.clip(np.mean(np.abs(self.soma_vector)), 0, 1))
 
         if hasattr(self, '_prev_semantic_state') and self._prev_semantic_state != self.semantic_state:
             self.concept_graph.record_transition((None, None, None, self._prev_semantic_state),
@@ -5193,11 +5254,26 @@ class Pattern:
                 continue
             # Затухание для всех концептов, не только малых
             decay = 0.995 if data['count'] > 10 else 0.99
+            # БЛОК 4: забвение — неиспользуемое дольше 300 шагов зарастает быстрее
+            # (не мгновенно — это порог для АДДИТИВНОГО ускорения затухания)
+            if Config.ENABLE_FORGETTING and self.age - data.get('last_used', self.age) > 300:
+                decay *= 0.95
             data['count'] *= decay
             if data['count'] < 0.5:
                 del self.concept_graph.nodes[sig_key]
                 if sig_key in self.concept_graph.edges:
                     del self.concept_graph.edges[sig_key]
+                # БЛОК 4: фикс висячих входящих рёбер — иначе граф хранит ссылки
+                # на удалённые узлы, что портит get_dominant_embedding/навигацию
+                for _src in list(self.concept_graph.edges.keys()):
+                    if sig_key in self.concept_graph.edges[_src]:
+                        del self.concept_graph.edges[_src][sig_key]
+                    if not self.concept_graph.edges[_src]:
+                        del self.concept_graph.edges[_src]
+                if not hasattr(self.world, '_forgotten_concepts_count'):
+                    pass
+                if self.world is not None:
+                    self.world._forgotten_concepts_count = getattr(self.world, '_forgotten_concepts_count', 0) + 1
 
         # ========== УДАЛЕНИЕ СЛАБЫХ КОНЦЕПТОВ (старая логика теперь объединена выше) ==========
         # Старый блок затухания удалён и заменён новым.
@@ -5303,6 +5379,21 @@ class Pattern:
             ]
             idx = int(phi_hash(self.id, self.age, 42) * len(reflections)) % len(reflections)
             report = reflections[idx]
+
+        # БЛОК 7: редкий инородный голос — прерывает обычную интроспекцию цитатой
+        # "извне" (очень редко, 2% шанс), затем субъективное время и зов поля смысла.
+        if Config.ENABLE_ALIEN_VOICE and phi_hash(self.id, self.age, 77777) < 0.02:
+            report = ALIEN_PHRASES[int(phi_hash(self.id, self.age, 88888) * len(ALIEN_PHRASES)) % len(ALIEN_PHRASES)]
+        if Config.ENABLE_SUBJECTIVE_TIME:
+            _drag_st = getattr(self, 'somatic_drag', 1.0)
+            _arousal_st = self.affect.get('arousal', 0.5) if hasattr(self, 'affect') else 0.5
+            report += " " + ("Время тянется, как свинец." if _drag_st < 0.7
+                             else "Время летит." if _arousal_st > 0.7 else "Время течёт ровно.")
+        if (Config.ENABLE_MEANING_FIELD and self.world is not None and
+                getattr(self.world, '_meaning_field', None) is not None and self.cells):
+            _mv_i = float(np.mean([self.world._meaning_field[x, y] for (x, y) in self.cells]))
+            if _mv_i > 0.3 and phi_hash(self.id, self.age, 54321) < 0.2:
+                report += f" Чувствую неясный зов (сила {_mv_i:.2f})."
 
         self._self_narrative.append({
             't': self.age,
@@ -5667,18 +5758,19 @@ class Pattern:
         # частей workspace. Throttle: тяжёлый corrcoef считаем раз в
         # EXPENSIVE_COMPUTE_INTERVAL шагов на агента, между пересчётами
         # используется закэшированное значение self._phi_proxy.
-        if not hasattr(self, '_ws_hist'):
-            self._ws_hist = deque(maxlen=8)
-        self._ws_hist.append(dict(raw_workspace))
-        if self.age % Config.EXPENSIVE_COMPUTE_INTERVAL == 0 and len(self._ws_hist) >= 4:
-            _M = np.array([list(h.values()) for h in self._ws_hist])
-            _C = np.corrcoef(_M, rowvar=False)
-            if not np.any(np.isnan(_C)):
-                _off = [abs(_C[i, j]) for i in range(4) for j in range(4) if i < j]
-                _coupling = float(np.mean(_off))
-                _H = -sum(w * np.log(w + 1e-9) for w in self.workspace_weights.values())
-                _diff = _H / np.log(4)
-                self._phi_proxy = float(np.clip(_coupling * _diff, 0, 1))
+        if Config.ENABLE_PHI_PROXY:
+            if not hasattr(self, '_ws_hist'):
+                self._ws_hist = deque(maxlen=8)
+            self._ws_hist.append(dict(raw_workspace))
+            if self.age % Config.EXPENSIVE_COMPUTE_INTERVAL == 0 and len(self._ws_hist) >= 4:
+                _M = np.array([list(h.values()) for h in self._ws_hist])
+                _C = np.corrcoef(_M, rowvar=False)
+                if not np.any(np.isnan(_C)):
+                    _off = [abs(_C[i, j]) for i in range(4) for j in range(4) if i < j]
+                    _coupling = float(np.mean(_off))
+                    _H = -sum(w * np.log(w + 1e-9) for w in self.workspace_weights.values())
+                    _diff = _H / np.log(4)
+                    self._phi_proxy = float(np.clip(_coupling * _diff, 0, 1))
 
         # --- 0.1) Аффективный примитив (valence/arousal) ---
         target_valence = float(np.clip(
