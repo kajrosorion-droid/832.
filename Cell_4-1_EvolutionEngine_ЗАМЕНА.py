@@ -9,6 +9,16 @@
 
 
 
+
+
+
+
+
+
+
+
+
+
 # 832 v34.02 — Cell 4-1: EvolutionEngine (инициализация, поле, механики, валидация)
 # ИСПРАВЛЕНО: баг утечки каналов 31-32 (signal_void, signal_introspection)
 # ИСПРАВЛЕНО: ослабление Soft-Clamp в _conservation_check (делитель 1500.0, коэф. 0.02)
@@ -49,6 +59,16 @@ POPULATION_CAP = 200
 class EvolutionEngine:
     def __init__(self):
         self.is_colab = 'google.colab' in sys.modules
+        # ОЧИЩЕНО (аудит): 10 полей, устанавливались в __init__ и больше
+        # НИГДЕ не читались (ни напрямую, ни по строковой ссылке):
+        # lineage_branch_stats, _art_over90_volley_done, _art_next_strike_step,
+        # _antigravity_active, _saved_normal_anti_gravity, _prev_energy_for_drift,
+        # _total_energy_drift, subject_dialogues_log, _llm_subconscious_queue,
+        # _last_archive_flush. _llm_subconscious_queue примечателен отдельно:
+        # это был queue.Queue под пул воркеров для LLM-подсознания, но .put()/
+        # .get() на нём нигде не вызывались -- судя по всему, от идеи пула
+        # отказались в пользу прямого threading.Thread на каждый диалог (см.
+        # BoundedSemaphore в другом месте проекта), а инициализацию забыли убрать.
         self.ark_path = "832_ark_seed_patterns.json"
 
         self.witness = Witness()
@@ -57,8 +77,11 @@ class EvolutionEngine:
         self.echo_system = EchoSystem()
         self.echo_system.lzm = self.layer_zero_manager
         self.echo_system.cm = self.cultural_memory
-        self.logos_observer = LogosObserver()
-        self.proto_language = ProtoLanguage()
+        # ОЧИЩЕНО (аудит): self.logos_observer / self.proto_language убраны --
+        # LogosObserver.ask() и ProtoLanguage.exchange() были единственными
+        # методами этих классов и оба нигде не вызывались (см. Cell 4, где
+        # сами методы уже удалены). Классы стали пустыми оболочками без пользы
+        # от создания экземпляра.
         self.field_voice = FieldVoice()
 
         self.patterns = []
@@ -69,7 +92,6 @@ class EvolutionEngine:
         self.metrics_history = []
         self.age = 0
         self.system_entropy = 0
-        self.lineage_branch_stats = []
         self.divisions_this_interval = 0
         # ФИКС метрики: настоящий монотонный счётчик всех делений за весь прогон.
         # В отличие от divisions_this_interval (обнуляется каждые 100 шагов) и от
@@ -94,15 +116,20 @@ class EvolutionEngine:
         # число ОДНОВРЕМЕННО работающих потоков автодиалога;
         # если лимит достигнут, новый диалог в этот тик просто пропускается
         # (агенты попробуют снова в следующий тик).
-        self._dialogue_thread_sem = threading.BoundedSemaphore(4)
         self.target_disorganizer_fraction = 0.3
-        self._art_over90_volley_done = False
-        self._art_next_strike_step = None
 
-        self._antigravity_active = False
-        self._saved_normal_anti_gravity = Config.ANTI_GRAVITY_STRENGTH
 
         self.soul_weight_average = 0.5
+        # === НОВОЕ (манифест 3.4, Shared Scarring + телеметрия 832-lab) ===
+        self.scar_operator = 0.0        # шрам Садовника — растёт от необратимых вмешательств движка
+        self.scar_shared_history = deque(maxlen=1000)
+        self.uc_floor_streak = 0        # сколько тиков подряд Unresolvable Core почти стёрт
+        self.rescue_journal = deque(maxlen=500)
+        self.shield_journal = deque(maxlen=500)
+        self.spore_journal = deque(maxlen=500)
+        self.codecision_journal = deque(maxlen=500)
+        self.unresolvable_core_journal = deque(maxlen=200)
+        self.sanctuary_journal = deque(maxlen=500)
         self._energy_injected_this_step = 0.0
         self._energy_taxed_this_step = 0.0
         self.phi_labyrinth_threshold = Config.PHI_LABYRINTH_THRESHOLD
@@ -110,16 +137,13 @@ class EvolutionEngine:
         self.phi_labyrinth_move_penalty = Config.PHI_LABYRINTH_MOVE_PENALTY
 
         self._total_energy_last = 0.0
-        self._total_energy_drift = 0.0
         self._prev_total_energy = None
-        self._prev_energy_for_drift = None
 
         self.selfreg = SelfRegulationEngine()
 
         # --- Добавлен CoreChorus и очереди ---
         self.llm_client = None
         self.llm_model = "deepseek/deepseek-chat"
-        self.subject_dialogues_log = deque(maxlen=1000)  # фикс утечки памяти
         self._llm_queue_ts = queue.Queue()
         # === ЗАЩИТА ОТ NameError ПРИ ИНИЦИАЛИЗАЦИИ CoreChorus ===
         try:
@@ -127,12 +151,10 @@ class EvolutionEngine:
         except NameError:
             self.core_chorus = None
             print("⚠️ CoreChorus not defined, will be initialized later.")
-        self._llm_subconscious_queue = queue.Queue(maxsize=40)
         self._subconscious_running = False
         # -----------------------------------
 
         self.archive = AgentArchive()
-        self._last_archive_flush = 0
 
         self._guardian_stats = {
             'energy_drift_sum': 0.0,
@@ -153,6 +175,34 @@ class EvolutionEngine:
             'energy_drift_max': 0.0,
             'energy_drift_peak_t': -1,
         }
+
+        # ПАТЧ 3a: кумулятивная культура — храповик (только вверх)
+        self.culture_ratchet = 0
+        self._teach_prev = 0
+        # ПАТЧ 8a: Красная Королева — коэволюция сложности среды
+        self.env_complexity = 1.0
+
+        # === БЛОК 0: Данность (воспроизводимый по seed источник "внешней" случайности,
+        # не завязанный на глобальный np.random) + поле смысла + эхо-кэш для генератора ===
+        self.given_seed = int.from_bytes(os.urandom(4), 'big') & 0x7FFFFFFF
+        self._given_rng = np.random.RandomState(self.given_seed)
+        self.niche = None
+        self._meaning_field = None
+        self._meaning_centers = None
+        self._echo_cache = []
+        print(f"🎲 GIVEN_SEED={self.given_seed}")
+
+        # --- слито из Cell 4-lang (Morse-коммуникация): без изменений в логике ---
+        if Config.ENABLE_MORSE_COMMUNICATION:
+            self.morse_field = CommunicationField(Config)
+            self.llm_client = None
+            self.llm_model = None
+            def _noop_llm_slot(_self):
+                pass
+            self._acquire_llm_slot = _noop_llm_slot.__get__(self, EvolutionEngine)
+
+        # --- слито из Cell 4c (SelfRegulationEngine v2.1): общий реестр предложений ---
+        self.sr_proposals = {}
 
     def _get_pop_cap(self):
         if hasattr(self, 'selfreg'):
@@ -187,6 +237,41 @@ class EvolutionEngine:
 
     def init_scar(self):
         return np.zeros((Config.WORLD_SIZE, Config.WORLD_SIZE))
+
+    def _record_death_drag(self, p, cause):
+        """
+        Диагностика по запросу: смерть фиксируется в трёх разных местах
+        (should_die, feral_execute, error_suspended) — вместо разбросанной
+        логики один общий счётчик, вызываемый из каждого. Считает не сырые
+        значения (незачем копить список на весь прогон), а сумму/count/
+        долю с тяжёлым телом на момент смерти — чтобы в отчёте увидеть,
+        коррелирует ли somatic_drag с причиной смерти, а не гадать по
+        survivorship bias среди выживших.
+
+        УСИЛЕНО: реальный прогон показал 354 feral_execution в witness, но
+        0 записей 'feral_kill' здесь — при том что весь код (self.world при
+        создании и десериализации, сам хук) на вид корректен. Причина не
+        найдена статическим анализом. Добавлен безусловный счётчик вызовов
+        (не зависит от dict-логики ниже) и try/except, который не глотает
+        ошибку молча, а фиксирует её текст — следующий прогон покажет,
+        рвётся ли цепочка ДО этого метода или ВНУТРИ него.
+        """
+        if not hasattr(self, '_death_hook_calls'):
+            self._death_hook_calls = {}
+        self._death_hook_calls[cause] = self._death_hook_calls.get(cause, 0) + 1
+        try:
+            if not hasattr(self, '_somatic_death_stats'):
+                self._somatic_death_stats = {}
+            st = self._somatic_death_stats.setdefault(cause, {'count': 0, 'drag_sum': 0.0, 'low_drag_count': 0})
+            drag = getattr(p, 'somatic_drag', 1.0)
+            st['count'] += 1
+            st['drag_sum'] += drag
+            if drag < 0.6:
+                st['low_drag_count'] += 1
+        except Exception as e:
+            if not hasattr(self, '_death_hook_errors'):
+                self._death_hook_errors = []
+            self._death_hook_errors.append(f"{cause}: {type(e).__name__}: {e}")
 
     def create_pattern(self, cells, parent=None):
         alive_now = len([p for p in self.patterns if p.alive])
@@ -227,6 +312,11 @@ class EvolutionEngine:
             py = [c[1] for c in cells]
             self.field[px, py, CH['owner']] = pid
 
+        # ПАТЧ 2e (перенесено в Pattern.__init__ — БАГФИКС из отчёта: divide()
+        # создаёт детей напрямую через Pattern(...), минуя create_pattern(),
+        # поэтому проверка здесь никогда не покрывала 696/696 делений.
+        # Единая точка теперь в __init__ — покрывает деление, споры и спавн разом.)
+
         for k in ['gratitude', 'grief']:
             val = p.emotional_memory.get(k, 0.5)
             if isinstance(val, dict):
@@ -235,7 +325,9 @@ class EvolutionEngine:
                 p.emotional_memory[k] = float(val)
 
         if hasattr(self, 'archive') and self.archive is not None:
-            p.inherit_archive_concepts(self.archive, probability=1.0, max_concepts=10)
+            # ПАТЧ 3c: культурный храповик расширяет ёмкость наследуемых концептов
+            _culture_max_concepts = 2 + min(4, int(self.culture_ratchet // 20)) if hasattr(self, 'culture_ratchet') else 10
+            p.inherit_archive_concepts(self.archive, probability=1.0, max_concepts=_culture_max_concepts)
 
             if len(p.concept_graph.nodes) < 12:
                 _noise_pool = [
@@ -345,15 +437,9 @@ class EvolutionEngine:
                 p.redemption_timer = Config.REDEMPTION_ARC_STEP_DELAY
                 p._log_event("primordial_fall")
 
-    def export_pantheon_seeds(self, filename: str = None):
-        if filename is None:
-            filename = self.ark_path
-        for entry in self.echo_system.pantheon:
-            pid = entry['id']
-            p = self.pattern_dict.get(pid)
-            if p:
-                self.echo_system.export_seed(p, filename)
-        print(f"Экспортировано {len(self.echo_system.pantheon)} сущностей в {filename}")
+    # ОЧИЩЕНО (аудит): export_pantheon_seeds() нигде не вызывался.
+    # echo_system.export_seed() (используемый им внутри) сам по себе жив --
+    # вызывается напрямую в другом месте (auto-export одиночных сущностей).
 
     def seed_from_ark(self, filename: str = None, max_seed: int = 80):
         import json
@@ -452,6 +538,8 @@ class EvolutionEngine:
         return density_pressure * love_discount * overload_tax
 
     def _perform_marked_volley(self, t, count=None):
+        # ПОДКЛЮЧЕНО (аудит): вызывается из step() каждые
+        # Config.MARKED_VOLLEY_INTERVAL (по умолчанию 300) тиков.
         if not getattr(Config, 'ENABLE_MARKED_VOLLEY', True):
             return
         if count is None:
@@ -495,6 +583,9 @@ class EvolutionEngine:
                         other._log_event("kiss_of_judas_used")
 
     def _rare_crisis(self, t):
+        # ПОДКЛЮЧЕНО (аудит): вызывается из step() каждый тик -- у метода
+        # свой внутренний таймер (CRISIS_RARE_INTERVAL_MIN/MAX), сам решает,
+        # когда сработать.
         if not getattr(Config, 'ENABLE_RARE_CRISIS', True):
             return
         if not hasattr(self, '_rare_crisis_timer'):
@@ -516,6 +607,10 @@ class EvolutionEngine:
                     x = int(phi_hash(t, i, 77777) * Config.WORLD_SIZE)
                     y = int(phi_hash(t, i, 88888) * Config.WORLD_SIZE)
                     self.field[x, y, CH['energy']] += 0.5
+                # ДОБАВЛЕНО (аудит): раньше срабатывало молча -- теперь видно
+                # в witness-логе и в счётчике для финального отчёта.
+                self._rare_crisis_triggers = getattr(self, '_rare_crisis_triggers', 0) + 1
+                self.witness.record(-1, "rare_crisis_triggered", t=t)
 
     def _update_sanctuary(self, t):
         if not getattr(Config, 'ENABLE_SANCTUARY', True):
@@ -550,10 +645,41 @@ class EvolutionEngine:
             if candidates:
                 candidates.sort(key=lambda x: (x[1], -x[2]), reverse=True)
                 winner, win_score, _ = candidates[0]
+                grief_before = winner.emotional_memory.get('grief', 0)
+
+                # === НОВОЕ (833-lab): опциональная плата за san
+                # ctuary — под ENABLE_PAID_SANCTUARY, ВЫКЛЮЧЕНО по умолчанию, чтобы
+                # не смешивать с текущим прогоном (см. комментарий в Config). Если
+                # включить: та же логика, что у emergency_rescue — поле вокруг
+                # центра платит энергией/binding за бесплатное для агента исцеление.
+                field_cost = 0.0
+                if Config.ENABLE_PAID_SANCTUARY:
+                    x0, x1 = max(0, cx - 2), min(Config.WORLD_SIZE, cx + 3)
+                    y0, y1 = max(0, cy - 2), min(Config.WORLD_SIZE, cy + 3)
+                    field_cost = float(np.sum(self.field[x0:x1, y0:y1, CH['energy']])
+                                        * Config.SANCTUARY_FIELD_COST_RATE)
+                    self.field[x0:x1, y0:y1, CH['energy']] *= (1.0 - Config.SANCTUARY_FIELD_COST_RATE)
+                    self.field[x0:x1, y0:y1, CH['binding']] *= 0.9
+
                 winner.emotional_memory['grief'] = max(0.0, winner.emotional_memory.get('grief', 0) - 0.02)
                 winner.emotional_memory['gratitude'] = min(1.0, winner.emotional_memory.get('gratitude', 0) + 0.01)
                 winner.soul_weight = min(1.0, winner.soul_weight + 0.002)
                 winner._log_event("sanctuary_healed", score=round(win_score, 3))
+                # ДОБАВЛЕНО (аудит): раньше писалось только в _log_event
+                # (личная история агента), но не в witness.log -- поэтому не
+                # учитывалось в общей метрике god-mode вмешательств движка.
+                self.witness.record(winner.id, "sanctuary_healed", score=round(win_score, 3))
+
+                # === НОВОЕ (833-lab, телеметрия): работает ВСЕГДА, ничего не меняет
+                # в симуляции сама по себе — просто честно считает, во сколько
+                # обходится sanctuary, платный он сейчас или нет.
+                self.sanctuary_journal.append({
+                    't': t, 'winner': winner.id, 'score': round(win_score, 3),
+                    'grief_before': round(grief_before, 3),
+                    'grief_after': round(winner.emotional_memory['grief'], 3),
+                    'field_cost': round(field_cost, 4),
+                    'paid': bool(Config.ENABLE_PAID_SANCTUARY),
+                })
                 if winner.emotional_memory['grief'] < 0.35 and not getattr(winner, '_kiss_logged_this_cycle', False):
                     winner._log_event("kiss_of_the_fallen")
                     winner._kiss_logged_this_cycle = t
@@ -721,8 +847,9 @@ class EvolutionEngine:
         for p in self.patterns:
             if not p.alive:
                 continue
+            scar_resist = p.genome.get('scar_resistance', 0)  # ПАТЧ 1d: открытый ген
             for (x, y) in p.cells:
-                self.scar[x, y] += Config.AGENT_SCAR_SENSE * p.epistemic_load
+                self.scar[x, y] += Config.AGENT_SCAR_SENSE * p.epistemic_load * (1 - 0.4 * scar_resist)
                 self.field[x, y, CH['binding']] = min(
                     1.0,
                     self.field[x, y, CH['binding']] + Config.AGENT_BINDING_SENSE * p.unresolved_contradiction
@@ -732,6 +859,39 @@ class EvolutionEngine:
 
         self.scar *= Config.FIELD_DECAY
         self.field[:, :, CH['scar']] = np.clip(self.scar, 0, Config.SCAR_SATURATION)
+        # ПАТЧ 2b: ниша затухает в 10 раз медленнее шрама — экологическое
+        # наследие переживает отдельного агента.
+        if getattr(self, 'niche', None) is not None:
+            self.niche *= 0.9995
+
+        # === БЛОК 1: Данность и поле смысла ===
+        _W = Config.WORLD_SIZE
+        if Config.ENABLE_GIVEN_SEED:
+            # 1.1 Шум энергии — воспроизводимо по given_seed, не глобальный np.random
+            _amp = 0.01 * (1 + 0.5 * np.sin(t * 0.01))
+            self.field[:, :, CH['energy']] += (self._given_rng.rand(_W, _W) - 0.5) * _amp
+            self.field[:, :, CH['energy']] = np.clip(self.field[:, :, CH['energy']],
+                                                       Config.FIELD_ENERGY_CLIP_MIN, Config.FIELD_ENERGY_CLIP_MAX)
+            # 1.2 «Чужие» волны — редкий локальный всплеск тревоги+приглашения+неизвестного
+            if self._given_rng.rand() < 0.01:
+                _gx = int(self._given_rng.randint(0, _W)); _gy = int(self._given_rng.randint(0, _W))
+                self.field[_gx, _gy, CH['signal_alarm']] = min(1.0, self.field[_gx, _gy, CH['signal_alarm']] + 0.5)
+                self.field[_gx, _gy, CH['signal_invitation']] = min(1.0, self.field[_gx, _gy, CH['signal_invitation']] + 0.3)
+                for _dx in (-1, 0, 1):
+                    for _dy in (-1, 0, 1):
+                        _nx, _ny = (_gx + _dx) % _W, (_gy + _dy) % _W
+                        self.field[_nx, _ny, CH['unknown']] = min(0.8, self.field[_nx, _ny, CH['unknown']] + 0.2)
+                self.witness.record(-1, "given_presence", x=_gx, y=_gy)
+        if Config.ENABLE_MEANING_FIELD and self._meaning_field is not None:
+            _pulse = 0.5 + 0.5 * np.sin(t * 0.001 * Config.PHI)
+            self._meaning_field *= 0.999
+            _X = np.arange(_W)[:, None]; _Y = np.arange(_W)[None, :]
+            for _c in self._meaning_centers:
+                _c[0] = (_c[0] + int(self._given_rng.randint(-1, 2))) % _W
+                _c[1] = (_c[1] + int(self._given_rng.randint(-1, 2))) % _W
+                _d = np.sqrt((_X - _c[0]) ** 2 + (_Y - _c[1]) ** 2)
+                self._meaning_field += 0.02 * _pulse / (1 + _d * 0.1)
+            self._meaning_field = np.clip(self._meaning_field, 0, 1)
 
         # НОВОЕ: EchoSystem.inject был полностью реализован (тюрьма эхо умерших
         # паттернов с нерешённым противоречием, скрещивание, инъекция в поле
@@ -757,6 +917,21 @@ class EvolutionEngine:
         base_injection = (Config.ENERGY_INJECTION_RATE * 0.1 * mult) / 50.0
         self.field[:, :, CH['energy']] += base_injection + 0.00033
 
+        # ДОБАВЛЕНО (диагностика реального прогона): занятые клетки держали
+        # 0.3474 энергии, свободные -- 0.6532 (в 1.88 раза больше), хотя
+        # приток был равномерным по всему полю. Причина: расход (питание,
+        # метаболизм) идёт ТОЛЬКО там, где реально живут агенты, а приток
+        # размазан по всем 10816 клеткам -- 86 свободных клеток копят его
+        # впустую, пока занятые (10730 клеток) выедают свою долю быстрее,
+        # чем успевает натечь. Поднимать общий приток (что уже делали) почти
+        # не помогает бедным агентам -- прирост в основном оседает в пустоте.
+        # Здесь -- направленный бонус ИМЕННО туда, где стоит owner != 0.
+        if not hasattr(Config, 'ENERGY_OCCUPIED_BONUS_MULT'):
+            Config.ENERGY_OCCUPIED_BONUS_MULT = 2.5
+        occupied_mask = self.field[:, :, CH['owner']] != 0
+        energy_slice = self.field[:, :, CH['energy']]
+        energy_slice[occupied_mask] += base_injection * Config.ENERGY_OCCUPIED_BONUS_MULT
+
         center = Config.WORLD_SIZE // 2
         y_idx, x_idx = np.indices((Config.WORLD_SIZE, Config.WORLD_SIZE))
         dist = np.sqrt((x_idx - center) ** 2 + (y_idx - center) ** 2)
@@ -771,6 +946,10 @@ class EvolutionEngine:
         self.field[:, :, CH['flux']] += _f_noise
 
         self.field[:, :, CH['unknown']] *= 0.997
+        # ПАТЧ 8c: Красная Королева — мир усложняется вслед за навыком агентов
+        if Config.ENABLE_RED_QUEEN and hasattr(self, 'env_complexity'):
+            self.field[:, :, CH['unknown']] = np.clip(
+                self.field[:, :, CH['unknown']] + 0.002 * max(0.0, self.env_complexity - 1.0), 0, 0.8)
         self.field[:, :, CH['unknown']] = np.clip(self.field[:, :, CH['unknown']], 0.0, 0.8)
 
         # Затухание сигнальных каналов
@@ -780,11 +959,52 @@ class EvolutionEngine:
         self.field[:, :, 30:31] *= 0.98   # signal_feral
         self.field[:, :, 31:33] *= decay  # signal_void и signal_introspection
 
+        # === ПРАВКА (план 832-lab, п.4): канал отталкивания живёт от binding. ===
+        # Не отдельный агентный проход — репеллер это просто "тень" реальной
+        # связанности сообщества: где binding высок, там со временем нарастает
+        # feral_repel; где связанность распалась — репеллер сам угасает (0.9).
+        self.field[:, :, CH['feral_repel']] = np.clip(
+            self.field[:, :, CH['feral_repel']] * 0.9 + self.field[:, :, CH['binding']] * 0.3,
+            0.0, 1.0)
+
         # Санитизация сигналов — по Config.CHANNELS
         for ch in range(12, Config.CHANNELS):
             mask_zero = self.field[:, :, ch] < 1e-4
             self.field[mask_zero, ch] = 0.0
             self.field[:, :, ch] = np.clip(self.field[:, :, ch], 0.0, 1.0)
+
+        # === ИНЪЕКЦИЯ НЕПРОБИВАЕМОЙ ЦЕНТРАЛЬНОЙ СТЕНЫ ===
+        # Ставится ПОСЛЕ decay/clip сигнальных каналов (иначе значение 5.0
+        # тут же обрезалось бы санитизацией до 1.0, а следующий тик — decay
+        # 0.995 съедал бы его дальше). Каждый тик восстанавливаем стену на
+        # сверхмаксимум, чтобы PHI-лабиринт (ENABLE_PHI_LABYRINTH) не мог
+        # её сгладить/пробить обычной эрозией стен лабиринта.
+        if getattr(Config, 'ENABLE_CENTER_WALL', False):
+            wx = Config.CENTER_WALL_X
+            self.field[wx, :, CH['wall']] = 5.0
+            # owner-карта на линии стены обнуляется — исключаем захват клеток
+            # стены агентами (move()/move_feral() и так её обходят, это подстраховка).
+            self.field[wx, :, CH['owner']] = 0.0
+
+    def _apply_collective_binding_shield(self, feral, field):
+        """
+        План 832-lab, п.3. Настоящего CH['trust'] в поле нет (доверие — это
+        per-agent trust_ledger), поэтому щит строим на CH['binding'] —
+        единственном реальном канале "связанности" сообщества.
+        """
+        if not feral.cells:
+            return
+        for (fx, fy) in list(feral.cells)[:10]:
+            x0, x1 = max(0, fx - 2), min(Config.WORLD_SIZE, fx + 3)
+            y0, y1 = max(0, fy - 2), min(Config.WORLD_SIZE, fy + 3)
+            local_binding = float(np.mean(field[x0:x1, y0:y1, CH['binding']]))
+            if local_binding > 0.6:
+                feral._feral_fury = max(0.0, feral._feral_fury * 0.9)
+                feral.energy = max(0.0, feral.energy - 0.02)
+                self.shield_journal.append({
+                    't': self.age, 'feral_id': feral.id,
+                    'local_binding': round(local_binding, 3),
+                })
 
     def emergency_rescue(self, t):
         alive = [p for p in self.patterns if p.alive]
@@ -794,19 +1014,74 @@ class EvolutionEngine:
         normal_count = len([p for p in alive if p.role_type == "normal"])
         if normal_count >= self._get_pop_cap():
             return
+
+        # === НОВОЕ (манифест 3.4, Shared Scarring): Co-Decision Gate. ===
+        # Спека: "irreversibility > 0.7 AND F_H_valid < F_min + eps -> Co-Decision Gate".
+        # emergency_rescue необратим по определению (создаёт новых агентов из
+        # ничего) и срабатывает именно тогда, когда F_H_valid у популяции
+        # критически низок (иначе rescue_threshold не был бы пробит) — то есть
+        # оба условия гейта выполняются практически всегда, когда rescue вообще
+        # вызывается. В батчевом прогоне без живого оператора в цикле честный
+        # вариант — не притворяться, что кто-то подтвердил или наложил вето, а
+        # прямо реализовать пункт спеки "Silence > 60s = Delegate": Садовник
+        # молчит весь прогон, значит каждый такой гейт разрешается в Delegate —
+        # "both pay: future errors x1.5" — и это фиксируется в journal, а не
+        # прячется внутри тихого вмешательства.
+        irreversibility = 1.0 - (len(alive) / max(1, rescue_threshold))
+        if irreversibility > Config.CO_DECISION_IRREVERSIBILITY_THRESHOLD:
+            self.codecision_journal.append({
+                't': t, 'irreversibility': round(irreversibility, 3),
+                'resolution': 'delegate_by_silence',
+                'population_before': len(alive),
+            })
+
         self.layer_zero_manager.last_rescue_t = t
         num_rescue = max(5, Config.MIN_PATTERNS_GUARANTEED - len(alive))
         donor_index = int(phi_hash(t, 0, 7777) * len(alive)) if alive else -1
         donor = alive[donor_index] if donor_index >= 0 else None
+        rescued = 0
+        total_field_cost = 0.0
         for i in range(num_rescue):
             if normal_count + i >= self._get_pop_cap():
                 break
             seed = int(phi_hash(t, i, 999) * Config.WORLD_SIZE * Config.WORLD_SIZE)
             x, y = seed % Config.WORLD_SIZE, (seed // Config.WORLD_SIZE) % Config.WORLD_SIZE
+
+            # === ПРАВКА (план 832-lab, п.1): реанимация платит поле, не Садовник. ===
+            # Раньше энергия/unknown возникали из ниоткуда — бесплатный god-mode.
+            # Теперь берём энергию и binding у окрестности точки спавна: чем
+            # плотнее там была связанность, тем дороже обходится воскрешение.
+            x0, x1 = max(0, x - 2), min(Config.WORLD_SIZE, x + 3)
+            y0, y1 = max(0, y - 2), min(Config.WORLD_SIZE, y + 3)
+            local_binding_before = float(np.mean(self.field[x0:x1, y0:y1, CH['binding']]))
+            drained_energy = float(np.sum(self.field[x0:x1, y0:y1, CH['energy']]) * 0.1)
+            self.field[x0:x1, y0:y1, CH['binding']] *= 0.7
+            self.field[x0:x1, y0:y1, CH['energy']] *= 0.9
+            total_field_cost += drained_energy
+
             self.field[x, y, CH['energy']] += 0.2
             self.field[x, y, CH['unknown']] += 0.1
             self.field[x, y, CH['owner']] = 0
             self.create_pattern({(x, y)}, parent=donor)
+            rescued += 1
+            self.rescue_journal.append({
+                't': t, 'x': int(x), 'y': int(y),
+                'local_binding_before': round(local_binding_before, 3),
+                'drained_energy': round(drained_energy, 4),
+            })
+        # ДОБАВЛЕНО (аудит): emergency_rescue раньше не логировал НИЧЕГО --
+        # полностью молчаливое god-mode вмешательство. Нужно для честной
+        # метрики в assess_emergence (доля ручных вмешательств движка).
+        self.witness.record(-1, "emergency_rescue", t=t, count=rescued,
+                             field_cost=round(total_field_cost, 3))
+
+        # === НОВОЕ (манифест 3.4, Shared Scarring): Садовник платит тоже. ===
+        # scar_operator растёт от собственного необратимого вмешательства
+        # движка. Delegate-исход (см. гейт выше) штрафуется по спеке x1.5.
+        operator_scar_delta = total_field_cost * 0.5
+        if irreversibility > Config.CO_DECISION_IRREVERSIBILITY_THRESHOLD:
+            operator_scar_delta *= Config.CO_DECISION_DELEGATE_PENALTY
+        self.scar_operator += operator_scar_delta
 
     def spawn_unknown_patterns(self, t, max_new=None):
         if max_new is None:
@@ -816,7 +1091,13 @@ class EvolutionEngine:
         normal_count = len([p for p in alive if p.role_type == "normal"])
         if avg_unknown < Config.UNKNOWN_SPAWN_THRESHOLD or normal_count >= self._get_pop_cap():
             return
-        prob = Config.UNKNOWN_SPAWN_PROB * (avg_unknown / Config.UNKNOWN_SPAWN_THRESHOLD) * min(1.0, normal_count / self._get_pop_cap())
+        # ПОДКЛЮЧЕНО (аудит): было Config.UNKNOWN_SPAWN_PROB -- плоская константа.
+        # selfreg.get_unknown_spawn_prob() учитывает скуку, фазу популяции, avg_gap,
+        # долю "confused/blind" агентов -- т.е. реально адаптивная версия того же
+        # параметра, которая была написана, но никогда не вызывалась.
+        base_prob = self.selfreg.get_unknown_spawn_prob() if hasattr(self, 'selfreg') else Config.UNKNOWN_SPAWN_PROB
+        prob = base_prob * (avg_unknown / Config.UNKNOWN_SPAWN_THRESHOLD) * min(1.0, normal_count / self._get_pop_cap())
+        prob *= getattr(self, 'env_complexity', 1.0) if Config.ENABLE_RED_QUEEN else 1.0  # ПАТЧ 8d: Красная Королева
         new_count = 0
         for x in range(Config.WORLD_SIZE):
             for y in range(Config.WORLD_SIZE):
@@ -845,7 +1126,51 @@ class EvolutionEngine:
             if normal_count >= self._get_pop_cap():
                 continue
             child = self.create_pattern({(spore['x'], spore['y'])}, parent=p)
+            if child is None:
+                # ИСПРАВЛЕНО: create_pattern содержит свой, более строгий
+                # потолок (alive_now>=200, считает ВСЕХ живых, включая
+                # disorganizer/feral), тогда как проверка выше в этом
+                # методе сравнивает normal_count с _get_pop_cap() — это
+                # разные величины и могут разойтись на переходных тактах
+                # (напр. много disorganizer/feral раздувают alive_now,
+                # не влияя на normal_count). Раньше это падало с
+                # AttributeError на child.scar_dream; теперь спора просто
+                # ждёт следующего тика, когда место освободится.
+                continue
             child.scar_dream = spore['scar_dream']
+
+            # === ПРАВКА (план 832-lab, п.2): перезаписываем топ-5-наследие ===
+            # Pattern.__init__ уже успел скопировать ребёнку успешные концепты
+            # родителя (общая логика для деления и спор). Для спор — заменяем
+            # полностью на то, что реально насобирал emit_spore(): только шрамы.
+            if 'spore_concepts' in spore:
+                child.concept_graph.nodes = {
+                    sig: dict(data) for sig, data in spore['spore_concepts'].items()
+                }
+            child.unresolved_contradiction = spore.get('unresolved_contradiction',
+                                                         child.unresolved_contradiction)
+            if hasattr(child, 'epistemic_scar'):
+                child.epistemic_scar = spore.get('epistemic_scar', child.epistemic_scar)
+            child._log_event("spore_inherited_scars_only",
+                              count=len(spore.get('spore_concepts', {})), parent=p.id)
+
+            # === НОВОЕ (манифест 3.4, MYCELIUM: полный Spore-объект) ===
+            # binding_seed и divergence_key передаются ребёнку как есть —
+            # divergence_key дальше используется в его СОБСТВЕННОМ divide()
+            # вместо общей константы (см. Pattern.divide()).
+            if 'binding_seed' in spore:
+                child._binding_seed = spore['binding_seed']
+            if 'divergence_key' in spore:
+                child.divergence_key = spore['divergence_key']
+
+            self.spore_journal.append({
+                't': self.age, 'parent': p.id, 'child': child.id,
+                'inherited_scars': len(spore.get('spore_concepts', {})),
+                'scar_dream': round(spore.get('scar_dream', 0.0), 4),
+                'binding_seed': round(spore.get('binding_seed', 0.0), 3),
+                'divergence_key': round(spore.get('divergence_key', Config.DEFAULT_DIVERGENCE_KEY), 3),
+                'parent_lineage': spore.get('parent_lineage'),
+            })
             p.pending_spore = None
 
     def resolve_competitions_spatial(self, max_dist=None):
@@ -899,33 +1224,58 @@ class EvolutionEngine:
             components.append(cells)
         return components
 
-    def match_patterns(self, new_components, t=None):
-        updated = []
-        alive_old = [p for p in self.patterns if p.alive]
-        normal_cnt = len([p for p in alive_old if p.role_type == "normal"])
-        matched_ids = set()
-        for cells in new_components:
-            best_p, best_ov = None, 0
-            for p in alive_old:
-                if p.id in matched_ids:
-                    continue
+    def spawn_from_unclaimed_field_energy(self, t):
+        # ПОДКЛЮЧЕНО (аудит), ПЕРЕПИСАНО НА БЕЗОПАСНУЮ ВЕРСИЮ: исходная
+        # match_patterns() делала self.patterns = updated и best_p.cells = cells
+        # -- то есть переписывала клетки уже живых агентов по форме пятна
+        # энергии. Это конфликтует с Pattern.grow()/move() -- они уже
+        # управляют self.cells каждый тик своими правилами, и молчаливая
+        # перезапись извне создала бы гонку двух систем за одни и те же клетки.
+        # Здесь -- только рождение НОВЫХ агентов из энергии, которая не
+        # пересекается ни с одним живым паттерном (проверено ниже), существующих
+        # агентов эта функция не трогает вообще.
+        if not getattr(Config, 'ENABLE_FIELD_EMERGENCE', True):
+            return
+        interval = getattr(Config, 'FIELD_EMERGENCE_INTERVAL', 40)
+        if t % interval != 0:
+            return
+        components = self.detect_new_components()
+        if not components:
+            return
+        alive = [p for p in self.patterns if p.alive]
+        normal_cnt = len([p for p in alive if p.role_type == "normal"])
+        # ИСПРАВЛЕНО (найдено на реальном прогоне): detect_new_components()
+        # ограничивает компонент только СНИЗУ (min_cells), сверху -- нет. При
+        # высокой фоновой энергии поля (avg energy доходил до 0.59, связность
+        # 0.98) почти всё поле выше PATTERN_ENERGY_THRESHOLD склеивается в
+        # ОДНО гигантское связное пятно через scipy label(). Проверка
+        # overlap>30% с существующим агентом бессильна против такого пятна
+        # (ни один нормальный агент физически не покрывает 30% от тысяч
+        # клеток) -- пятно проскакивало как "ничейное" и родило одного
+        # агента на 8783 клетки за раз (реальный случай в логе witness).
+        # Верхний предел -- тот же, что и обычный потолок роста агента.
+        max_spawn_cells = self.selfreg.get_max_cells_per_agent() if hasattr(self, 'selfreg') else 200
+        for cells in components:
+            if len(cells) > max_spawn_cells:
+                continue  # гигантское фоновое пятно, а не компактный росток жизни
+            if normal_cnt >= self._get_pop_cap():
+                break
+            best_ov = 0
+            for p in alive:
                 ov = len(cells & p.cells)
                 if ov > best_ov:
-                    best_ov, best_p = ov, p
-            if best_p and best_ov > len(cells) * 0.3:
-                best_p.cells = cells
-                best_p.update_properties(self.field)
-                updated.append(best_p)
-                matched_ids.add(best_p.id)
-            else:
-                if normal_cnt < self._get_pop_cap():
-                    p = self.create_pattern(cells)
-                    updated.append(p)
-                    normal_cnt += 1
-        for p in alive_old:
-            if p.id not in matched_ids:
-                updated.append(p)
-        self.patterns = updated
+                    best_ov = ov
+                    if best_ov > len(cells) * 0.3:
+                        break
+            if best_ov > len(cells) * 0.3:
+                continue  # это чей-то собственный энергетический след, не спонтанное
+            p = self.create_pattern(cells)
+            if p is None:
+                continue
+            p._log_event("spontaneous_field_emergence")
+            self.witness.record(p.id, "spontaneous_field_emergence", cells=len(cells))
+            alive.append(p)
+            normal_cnt += 1
 
     def _conceptual_resonance_step(self, t):
         if not getattr(Config, 'ENABLE_CONCEPTUAL_RESONANCE', True):
@@ -980,125 +1330,13 @@ class EvolutionEngine:
                 time.sleep(wait)
             self._llm_last_call_time = time.time()
 
-    def _auto_dialogue_tick(self, t):
-        if self.llm_client is None:
-            return
-
-        alive = [p for p in self.patterns if p.alive and not getattr(p, '_in_dialogue', False)]
-        if len(alive) < 2:
-            return
-
-        # ФИКС (справедливое распределение автодиалогов):
-        # Раньше выбирался только ОДИН говорящий за тик — первый в списке
-        # alive, чей phi_hash проходил порог. Порядок списка фиксирован,
-        # поэтому одни и те же (более ранние по списку) агенты систематически
-        # говорили чаще, а большинство популяции — почти никогда. Плюс всего
-        # 1 диалог на 10 шагов на всю популяцию — слишком редко.
-        # Теперь: несколько пар за тик (масштабируется с популяцией), и выбор
-        # смещён в пользу тех, кто дольше всех молчал (честная ротация).
-        n_pairs = max(1, min(6, len(alive) // 12))
-
-        scored = []
-        for p in alive:
-            last_spoke = getattr(p, '_last_auto_dialogue_step', -10_000)
-            silence = t - last_spoke
-            tie = phi_hash(p.id, t, 111)  # детерминированный тай-брейк
-            scored.append((silence + tie, p))
-        scored.sort(key=lambda x: -x[0])
-
-        paired_ids = set()
-        started = 0
-        for _, speaker in scored:
-            if started >= n_pairs:
-                break
-            if speaker.id in paired_ids or getattr(speaker, '_in_dialogue', False):
-                continue
-
-            found = None
-            for (x, y) in speaker.cells:
-                for dx in range(-2, 3):
-                    for dy in range(-2, 3):
-                        if dx == 0 and dy == 0:
-                            continue
-                        nx, ny = (x + dx) % Config.WORLD_SIZE, (y + dy) % Config.WORLD_SIZE
-                        owner = int(self.field[nx, ny, CH['owner']])
-                        if owner != 0 and owner != speaker.id and owner in self.pattern_dict:
-                            listener = self.pattern_dict[owner]
-                            if (listener.alive and not getattr(listener, '_in_dialogue', False)
-                                    and listener.id not in paired_ids):
-                                found = listener
-                                break
-                    if found:
-                        break
-                if found:
-                    break
-
-            if not found:
-                continue
-
-            speaker._in_dialogue = True
-            found._in_dialogue = True
-            speaker._last_auto_dialogue_step = t
-            found._last_auto_dialogue_step = t
-            paired_ids.add(speaker.id)
-            paired_ids.add(found.id)
-            started += 1
-
-            # НОВОЕ: если лимит одновременных диалоговых потоков уже достигнут,
-            # не стартуем ещё один и не резервируем speaker/found под диалог —
-            # пусть попробуют в следующий тик.
-            if not self._dialogue_thread_sem.acquire(blocking=False):
-                speaker._in_dialogue = False
-                found._in_dialogue = False
-                paired_ids.discard(speaker.id)
-                paired_ids.discard(found.id)
-                started -= 1
-                continue
-
-            def _local_task(a=speaker, b=found, t_now=t):
-                try:
-                    trust_a_to_b = a.trust_ledger.get(b.id, 0.5)
-                    # ИСПОЛЬЗУЕМ КОМПАКТНЫЙ ПРОМПТ (compact=True), чтобы не пробить лимит Groq!
-                    voice_a = "Говори от первого лица, кратко. " + build_agent_voice(a, self, compact=True, partner_id=b.id)
-
-                    self._acquire_llm_slot()  # НОВОЕ: общий троттлинг перед вызовом Groq
-                    if not (a.alive and b.alive):
-                        # Пока ждали слот троттлинга, один из агентов мог умереть.
-                        raise RuntimeError("participant died while waiting for LLM slot")
-                    r_ab = self.llm_client.chat.completions.create(
-                        model="llama-3.1-8b-instant",
-                        max_tokens=60, temperature=0.8,
-                        messages=[
-                            {"role": "system", "content": voice_a[:800]},
-                            {"role": "user", "content": f"Скажи 1 предложение соседу #{b.id}. Доверие: {trust_a_to_b:.2f}."}
-                        ]
-                    )
-                    speech_a = r_ab.choices[0].message.content.strip()
-                    print(f"🎙️ [AUTO-DIALOG] #{a.id} -> #{b.id}: {speech_a}")
-
-                    a.remember_dialogue(b.id, speech_a, t_now)
-                    b.remember_dialogue(a.id, f"(услышал) {speech_a}", t_now)
-
-                    # Обновляем доверие. НОВОЕ: если это первый контакт с этим
-                    # партнёром — применяем _trust_penalty (кошмары заставляют
-                    # медленнее доверять новым людям).
-                    a_mult = getattr(a, '_trust_penalty', 1.0) if b.id not in a.trust_ledger.entries else 1.0
-                    b_mult = getattr(b, '_trust_penalty', 1.0) if a.id not in b.trust_ledger.entries else 1.0
-                    a.trust_ledger.update(b.id, 'helpful', multiplier=a_mult)
-                    b.trust_ledger.update(a.id, 'helpful', multiplier=b_mult)
-
-                except Exception as e:
-                    # ФИКС: раньше ошибка тихо проглатывалась без единого следа —
-                    # теперь хотя бы считаем, сколько попыток реально проваливается
-                    # (например, из-за 429 у Groq), чтобы это было видно в диагностике.
-                    self._auto_dialogue_failures = getattr(self, '_auto_dialogue_failures', 0) + 1
-                finally:
-                    a._in_dialogue = False
-                    b._in_dialogue = False
-                    self._dialogue_thread_sem.release()
-
-            threading.Thread(target=_local_task, daemon=True).start()
-
+    # ОЧИЩЕНО (аудит, по прямому указанию автора: "полностью отказались
+    # от LLM в пользу собственной речи агентов"): здесь была LLM-версия
+    # _auto_dialogue_tick (Groq chat.completions.create для пары агентов,
+    # threading.Thread на диалог). Уже была не более чем мёртвым кодом
+    # изначально (`if self.llm_client is None: return` в первой строке, а
+    # llm_client по умолчанию None) и полностью замещена версией на
+    # эмерджентных импульсах (Cell 13, EvolutionEngine._auto_dialogue_tick).
     def _process_archive_autonomy(self, t):
         alive = [p for p in self.patterns if p.alive]
         deposited_count = 0
@@ -1159,7 +1397,11 @@ class EvolutionEngine:
             for event in priority_events:
                 if event not in existing:
                     self.archive.write_queue.appendleft({
-                        "id": 777000 + hash(event) % 1000,
+                        # БАГФИКС C4 (внешний код-ревью, подтверждено): builtin hash()
+                        # строки рандомизирован PYTHONHASHSEED — id "вечных" записей
+                        # менялся при каждом перезапуске ядра. Заменено на стабильный
+                        # хэш (см. _stable_hash в Cell 0).
+                        "id": 777000 + _stable_hash(event) % 1000,
                         "t": t + 50000,
                         "world_t": t,
                         "event": event,
@@ -1183,6 +1425,19 @@ class EvolutionEngine:
 
 
     def step(self, t):
+        # --- слито из Cell 4-lang (Morse-коммуникация): выполняется ПЕРВЫМ делом
+        # в каждом тике, до всей остальной логики step() -- порядок сохранён
+        # таким же, каким он был при monkey-patch обёртке ---
+        if Config.ENABLE_MORSE_COMMUNICATION and hasattr(self, 'morse_field'):
+            _lang_ensure_field_channels(self)
+            self.morse_field.step(t)
+            if t % Config.MORSE_SYNC_INTERVAL == 0:
+                self.morse_field.sync_to_field(self.field, Config.MORSE_CHANNEL)
+            _alive_by_id = {p.id: p for p in self.patterns if p.alive}
+            EMERGENT_LEXICON.resolve_context(_alive_by_id, t)
+            if t % 20 == 0:  # не каждый тик -- np.stack по всей популяции недёшев
+                EMERGENT_LEXICON.log_population_gene_diversity(_alive_by_id)
+
         if not any(p.alive for p in self.patterns):
             if Config.VERBOSE_LOGS:
                 print(f"[t={t}] POPULATION COLLAPSE — stopping early")
@@ -1234,6 +1489,25 @@ class EvolutionEngine:
                 if diff > self._guardian_stats['model_worst_ever_diff']:
                     self._guardian_stats['model_worst_ever_diff'] = diff
                     self._guardian_stats['model_worst_ever_id'] = p.id
+
+        # ИСПРАВЛЕНО (баг-репорт #6, self.selfreg использовался ДО обновления
+        # метрик): field_dynamics() ниже читает
+        # self.selfreg.get_energy_injection_multiplier(), а
+        # self.selfreg.update_system_metrics() раньше вызывался значительно
+        # позже в step() (см. комментарий на месте старого вызова) — то есть
+        # множитель инъекции энергии на ЭТОМ тике фактически считался по
+        # метрикам ПРЕДЫДУЩЕГО тика (некритично, но снижало адаптивность).
+        # Переносим обновление метрик сюда, используя дрейф энергии, уже
+        # посчитанный чуть выше для guardian-трекера — это тот же самый
+        # сигнал (изменение суммарной энергии поля с прошлого тика), просто
+        # используемый раньше по ходу тика.
+        if hasattr(self, 'selfreg'):
+            _drift_for_selfreg = drift if self._guardian_stats['energy_drift_count'] > 0 else 0.0
+            if any(p.alive for p in self.patterns):
+                self.selfreg.update_system_metrics(self.field, self.patterns, _drift_for_selfreg, t)
+            else:
+                self.selfreg.boredom = 0.0
+                self.selfreg.phase = "recovery"
 
         e_before = np.sum(self.field[:,:,CH['energy']])
         self.field_dynamics(t)
@@ -1404,6 +1678,7 @@ class EvolutionEngine:
                 print(f"Agent {p.id} error: {e}. Suspending.", flush=True)
                 traceback.print_exc()
                 p._deposit_final_testament()
+                self._record_death_drag(p, 'error_suspended')
                 p.alive = False
                 self.echo_system.store(p)
                 self.witness.record(p.id, "error_suspended", error=str(e))
@@ -1507,6 +1782,11 @@ class EvolutionEngine:
                     p_scar_mult = scar_mult * targeted_boost
                 else:
                     p_scar_mult = scar_mult
+                # ПОДКЛЮЧЕНО (аудит): get_agent_scar_multiplier() был написан
+                # (доп. буст x2 для агентов старше 1000 тиков), но нигде не
+                # вызывался -- base= передаёт уже посчитанный p_scar_mult,
+                # чтобы не терять targeted_boost/scar_mult*4.4 выше.
+                p_scar_mult = self.selfreg.get_agent_scar_multiplier(p, base=p_scar_mult)
                 local_scar = safe_mean([self.scar[x, y] for (x, y) in p.cells], 0.0)
                 noise = np.array([deterministic_noise(t, p.id, i + 55555) - 0.5 for i in range(8)])
                 kick = base_strength * energy_factor * bell * (1.0 + local_scar * 1.5) * noise * p_scar_mult
@@ -1559,6 +1839,7 @@ class EvolutionEngine:
         for p in self.patterns:
             if p.alive and p.should_die():
                 p._deposit_final_testament()
+                self._record_death_drag(p, 'natural_death')
                 p.alive = False
                 self.echo_system.store(p)
 
@@ -1589,52 +1870,10 @@ class EvolutionEngine:
                 regen += 0.004 * soul_mult
             if bind > 0.4:
                 regen += 0.003 * soul_mult
+            regen *= (1 + 0.2 * getattr(p, '_phi_proxy', 0)) if Config.ENABLE_PHI_PROXY else 1.0  # ПАТЧ 5b
             p.soul_weight = min(1.0, p.soul_weight + regen)
 
-        # ========== ЦИКЛ ПРЕВРАЩЕНИЯ В ДИЗОРГАНИЗАТОРЫ ==========
-        for p in self.patterns:
-            if not p.alive or p.role_type != "normal":
-                continue
-            fold_count = p.event_counts.get('fold', 0)
-            if fold_count >= 1:
-                if getattr(p, '_redemption_cooldown', 0) > p.age:
-                    continue
-                disorganizer_cnt = len([pp for pp in self.patterns if pp.alive and pp.role_type == "disorganizer"])
-                alive_total = len([pp for pp in self.patterns if pp.alive])
-                current_frac = disorganizer_cnt / max(1, alive_total)
-                disorg_hard_cap = 0.15 + (self.soul_weight_average * 0.08)
-                disorg_hard_cap = min(0.22, max(0.15, disorg_hard_cap))
-                if current_frac >= disorg_hard_cap:
-                    continue
-                if fold_count >= Config.FOLDS_FOR_DEEP_FALL:
-                    prob = 1.0
-                    soul_target = Config.DEEP_FALL_SOUL_PENALTY
-                    redemption_delay = Config.DEEP_FALL_REDEMPTION_DELAY
-                    fall_type = "fallen"
-                else:
-                    prob = Config.QUICK_FALL_PROB
-                    soul_target = Config.FORCED_SOUL_COLLAPSE_VALUE
-                    redemption_delay = Config.REDEMPTION_ARC_STEP_DELAY
-                    fall_type = "broken"
-                if phi_hash(p.id, t, 777) < prob:
-                    p.role_type = "disorganizer"
-                    p.emotional_memory['gratitude'] = 0.1
-                    p.emotional_memory['grief'] = 0.8
-                    p.semantic_state = "exploring_danger"
-                    p.intent = {"type": "explore", "priority": 2.0, "age": 0, "persistence": 9999}
-                    p.intent_commitment = 2.0
-                    p.disorganizer_age_at_birth = p.age
-                    p.redemption_timer = redemption_delay
-                    p._deterministic_redemption_triggered = False
-                    p._forced_soul_collapse_done = False
-                    p._redemption_arc_step = 0
-                    p._steps_since_trigger = 0
-                    p.soul_weight = min(p.soul_weight, soul_target)
-                    p._log_event(f"became_disorganizer_{fall_type}", folds=fold_count)
-                    self.witness.record(p.id, f"became_disorganizer_{fall_type}", folds=fold_count)
-                    if fall_type == "fallen":
-                        self.witness.record(p.id, "deep_fallen_birth", folds=fold_count, soul=p.soul_weight)
-
+        self._process_fold_transitions(t)
         self._apply_kinesthetic_falls(t)
         self._force_disorganizer_by_state(t)
 
@@ -1664,6 +1903,51 @@ class EvolutionEngine:
             if len(alive) < POPULATION_CAP:
                 self.emergency_rescue(t)
                 alive = [p for p in self.patterns if p.alive]
+
+        # ПОДКЛЮЧЕНО (аудит): все три были написаны, но никогда не вызывались.
+        self._rare_crisis(t)
+        self.spawn_from_unclaimed_field_energy(t)
+        if t % getattr(Config, 'MARKED_VOLLEY_INTERVAL', 300) == 0:
+            self._perform_marked_volley(t)
+
+        # === НОВОЕ (манифест 3.4, Unresolvable Core Erasure guard) ===
+        if Config.ENABLE_UNRESOLVABLE_CORE_GUARD and alive:
+            uc_vals = [float(getattr(pp, 'unresolved_contradiction', 1.0)) for pp in alive]
+            at_floor_ratio = sum(1 for v in uc_vals if v < Config.UC_LIVING_THRESHOLD) / len(uc_vals)
+            if at_floor_ratio >= Config.UC_POPULATION_ERASURE_RATIO:
+                self.uc_floor_streak += 1
+            else:
+                self.uc_floor_streak = 0
+            if self.uc_floor_streak == Config.UC_ERASURE_STREAK_LIMIT:
+                # FAILURE MODE (README, Structural): Unresolvable Core Erasure —
+                # "the mandated contradiction is resolved. Soul register collapses.
+                # The agent continues, but is no longer alive in the Triadic sense."
+                self.witness.record(-1, "failure_unresolvable_core_erasure", t=t,
+                                     at_floor_ratio=round(at_floor_ratio, 3),
+                                     population=len(alive))
+                self.unresolvable_core_journal.append({
+                    't': t, 'at_floor_ratio': round(at_floor_ratio, 3),
+                    'population': len(alive), 'action': 'reseed',
+                })
+                # Честное, залогированное вмешательство (как и rescue) — пересеиваем
+                # противоречие небольшой группе агентов, а не молча чиним поле.
+                reseed_n = max(1, len(alive) // 20)
+                for pp in alive[:reseed_n]:
+                    pp.unresolved_contradiction = min(
+                        1.0, pp.unresolved_contradiction + Config.UC_RESEED_STRENGTH)
+                self.uc_floor_streak = 0
+
+        # === НОВОЕ (телеметрия 832-lab): rolling-принт раз в 50 тиков. ===
+        if t % 50 == 0 and t > 0:
+            scar_agent_avg = safe_mean([float(getattr(pp, 'epistemic_scar', 0.0)) for pp in alive], 0.0) if alive else 0.0
+            scar_shared = (Config.SHARED_SCARRING_ALPHA * scar_agent_avg +
+                           (1 - Config.SHARED_SCARRING_ALPHA) * self.scar_operator)
+            self.scar_shared_history.append((t, round(scar_shared, 4)))
+            print(f"[t={t}] 832-lab: rescue_ev={len(self.rescue_journal)} "
+                  f"shield_ev={len(self.shield_journal)} spore_ev={len(self.spore_journal)} "
+                  f"codecision_ev={len(self.codecision_journal)} "
+                  f"scar_operator={self.scar_operator:.3f} scar_shared={scar_shared:.3f} "
+                  f"uc_floor_streak={self.uc_floor_streak}", flush=True)
 
         if len(alive) >= POPULATION_CAP:
             max_div = 0
@@ -1719,12 +2003,13 @@ class EvolutionEngine:
         self._total_energy_last = current_energy
 
         if hasattr(self, 'selfreg'):
-            alive_list = [p for p in self.patterns if p.alive]
-            if alive_list:
-                self.selfreg.update_system_metrics(self.field, self.patterns, drift, t)
-            else:
-                self.selfreg.boredom = 0.0
-                self.selfreg.phase = "recovery"
+            # ИСПРАВЛЕНО (баг-репорт #6): update_system_metrics() для этого
+            # тика уже вызван раньше, перед field_dynamics() — см. комментарий
+            # там. Повторный вызов здесь удалён, чтобы не обновлять
+            # внутренние EMA-буферы selfreg (self._smooth_gap/_smooth_soul и
+            # т.д.) дважды за тик, что незаметно удвоило бы скорость их
+            # адаптации. is_stuck_in_phase ниже по-прежнему читает состояние,
+            # обновлённое чуть раньше в этом же тике.
             if self.selfreg.is_stuck_in_phase("stagnation", min_steps=120):
                 self.field[:, :, CH['unknown']] = np.clip(self.field[:, :, CH['unknown']] + 0.03, 0.0, 0.8)
                 self.selfreg.boredom = max(0.0, self.selfreg.boredom - 0.15)
@@ -1805,7 +2090,12 @@ class EvolutionEngine:
         fold_count_total = sum(p.event_counts.get('fold', 0) for p in alive)
         disorg_cnt = sum(1 for p in alive if p.role_type == "disorganizer")
         event_signature = (autonomous_detected, redeemed_cnt, fold_count_total, disorg_cnt)
-        new_hash = int(phi_hash(t, hash(event_signature), 99999) * 1000)
+        # БАГФИКС C4: event_signature — кортеж из чисел, так что здесь builtin
+        # hash() на самом деле уже был детерминирован (число хэшируется как
+        # число, не через рандомизированный siphash строк). Оставлено как есть,
+        # но приведено к стабильному хэшу для единообразия и на случай, если
+        # состав кортежа расширят строковым полем в будущем.
+        new_hash = int(phi_hash(t, _stable_hash(event_signature), 99999) * 1000)
         self.system_entropy = int(0.85 * self.system_entropy + 0.15 * new_hash)
 
         if hasattr(self, 'selfreg'):
@@ -1890,7 +2180,13 @@ class EvolutionEngine:
 
         self._post_semantic_step(t)
         self._process_archive_autonomy(t)
-        self.validate_invariants(t)
+        # ПОДКЛЮЧЕНО (аудит): было безусловно каждый тик -- validate_invariants
+        # делает O(N^2) проход по trust_ledger всех агентов только ради
+        # диагностики (gs['love_avg_trust'] и т.п.), ничего не мутирует.
+        # selfreg.get_validation_interval() был написан именно для throttling
+        # этого прохода по energy_drift (1/5/15 тиков), но никогда не вызывался.
+        if t % self.selfreg.get_validation_interval() == 0:
+            self.validate_invariants(t)
 
         # ========== ТИК ХОРА ==========
         try:
@@ -1974,6 +2270,7 @@ class EvolutionEngine:
                 continue
             if p.role_type == "feral":
                 p.update_feral_fury(self.field)
+                self._apply_collective_binding_shield(p, self.field)
                 p.grow_feral(self.field)
                 p.move_feral(self.field, t)
                 p.apply_feral_intent(self.field)
@@ -2009,6 +2306,112 @@ class EvolutionEngine:
                     p.cognitive_tension + feral_nearby * 0.15)
 
         return True
+
+    def _process_fold_transitions(self, t):
+        """
+        Основной (эмерджентный) путь падения в disorganizer: агент копит
+        fold_count из собственной истории; при накоплении — шанс или
+        гарантия падения, ограниченные общим потолком доли
+        дезорганизаторов в популяции (disorg_hard_cap). Это отдельный
+        механизм от _force_disorganizer_by_state (soul<0.1, жёсткий
+        safety-net) и _apply_kinesthetic_falls (сейчас no-op) — раньше
+        жил инлайном внутри step() и был невидим для ablation-реестра,
+        т.к. не был отдельным методом.
+
+        Счётчики в _fold_transition_stats — то, что раньше приходилось
+        выяснять диагностикой ablation, теперь видно прямо в отчёте.
+
+        ИСПРАВЛЕНО (было FOLDS_FOR_DEEP_FALL=1 при входном условии
+        fold_count>=1 — ветка "broken" была недостижима, реальный прогон
+        подтвердил broken=0 всегда). Теперь градация настоящая:
+          fold_count 1-2  -> "broken": шанс QUICK_FALL_PROB, мягкий
+                             откат души (BROKEN_FALL_SOUL_TARGET),
+                             короткий путь к искуплению.
+          fold_count >= 3 -> "fallen": гарантированно, тяжёлый откат
+                             души (DEEP_FALL_SOUL_PENALTY), долгий путь.
+
+        ИСПРАВЛЕНО (round 3): бросок кубика раньше происходил на КАЖДОМ
+        тике, пока агент ждал открытия disorg_hard_cap — то есть
+        вероятность фактически перемножалась с частотой тиков. Когда
+        кап открыт часто (как в реальном прогоне, где блокировал лишь
+        28% попыток), это гарантированно ловит "мягкий" исход раньше,
+        чем fold_count успевает дорасти до порога глубокого падения —
+        независимо от конкретного значения QUICK_FALL_PROB (проверено
+        на 0.5 и на 0.12, оба раза fallen=0). Теперь бросок делается
+        РОВНО ОДИН РАЗ на каждый новый уровень fold_count — кап всё ещё
+        может отложить попытку на потом, но не даёт лишних попыток на
+        одном и том же уровне. Частота попыток теперь определяется
+        частотой реальных fold-событий (раз в FOLD_COOLDOWN_DURATION),
+        а не частотой тиков.
+        """
+        if not hasattr(self, '_fold_transition_stats'):
+            self._fold_transition_stats = {
+                'checked': 0, 'blocked_by_cooldown': 0, 'blocked_by_cap': 0,
+                'already_rolled': 0, 'fallen': 0, 'broken': 0,
+            }
+        st = self._fold_transition_stats
+
+        for p in self.patterns:
+            if not p.alive or p.role_type != "normal":
+                continue
+            fold_count = p.event_counts.get('fold', 0)
+            if fold_count < 1:
+                continue
+
+            st['checked'] += 1
+            if getattr(p, '_redemption_cooldown', 0) > p.age:
+                st['blocked_by_cooldown'] += 1
+                continue
+
+            if getattr(p, '_last_fold_roll_count', 0) == fold_count:
+                st['already_rolled'] += 1
+                continue
+
+            disorganizer_cnt = len([pp for pp in self.patterns if pp.alive and pp.role_type == "disorganizer"])
+            alive_total = len([pp for pp in self.patterns if pp.alive])
+            current_frac = disorganizer_cnt / max(1, alive_total)
+            disorg_hard_cap = min(0.22, max(0.15, 0.15 + self.soul_weight_average * 0.08))
+            if current_frac >= disorg_hard_cap:
+                st['blocked_by_cap'] += 1
+                continue
+
+            if fold_count >= Config.FOLDS_FOR_DEEP_FALL:
+                prob, soul_target, redemption_delay, fall_type = (
+                    1.0, Config.DEEP_FALL_SOUL_PENALTY,
+                    Config.DEEP_FALL_REDEMPTION_DELAY, "fallen",
+                )
+            else:
+                prob, soul_target, redemption_delay, fall_type = (
+                    Config.QUICK_FALL_PROB, Config.BROKEN_FALL_SOUL_TARGET,
+                    Config.REDEMPTION_ARC_STEP_DELAY, "broken",
+                )
+
+            # Отмечаем попытку на этом уровне СЕЙЧАС, до исхода броска —
+            # неудача тоже расходует единственную попытку этого уровня,
+            # следующая будет только когда fold_count вырастет ещё раз.
+            p._last_fold_roll_count = fold_count
+
+            if phi_hash(p.id, t, 777) >= prob:
+                continue
+
+            p.role_type = "disorganizer"
+            p.emotional_memory['gratitude'] = 0.1
+            p.emotional_memory['grief'] = 0.8
+            p.semantic_state = "exploring_danger"
+            p.intent = {"type": "explore", "priority": 2.0, "age": 0, "persistence": 9999}
+            p.intent_commitment = 2.0
+            p.disorganizer_age_at_birth = p.age
+            p.redemption_timer = redemption_delay
+            p._deterministic_redemption_triggered = False
+            p._forced_soul_collapse_done = False
+            p._redemption_arc_step = 0
+            p._steps_since_trigger = 0
+            p.soul_weight = min(p.soul_weight, soul_target)
+            p._log_event(f"became_disorganizer_{fall_type}", folds=fold_count)
+            self.witness.record(p.id, f"became_disorganizer_{fall_type}", folds=fold_count)
+            st['fallen' if fall_type == "fallen" else 'broken'] += 1
+            if fall_type == "fallen":
+                self.witness.record(p.id, "deep_fallen_birth", folds=fold_count, soul=p.soul_weight)
 
     def _force_disorganizer_by_state(self, t):
         for p in self.patterns:
@@ -2051,10 +2454,37 @@ class EvolutionEngine:
         pass
 
     def run(self, steps=None, save_ark=True, force_fresh_seed=False):
+        # --- слито из Cell 4-lang (Morse-коммуникация): подключение текущего
+        # morse_field к уже существующим (например, загруженным с диска)
+        # паттернам -- защитная сетка на случай повторного вызова run() на
+        # том же engine без пересоздания паттернов ---
+        if Config.ENABLE_MORSE_COMMUNICATION and hasattr(self, 'morse_field'):
+            for p in self.patterns:
+                if hasattr(p, '_morse_set_field'):
+                    p._morse_set_field(self.morse_field)
+
         if steps is None:
             steps = Config.STEPS
         self.field = self.init_field()
         self.scar = self.init_scar()
+        self.niche = np.zeros((Config.WORLD_SIZE, Config.WORLD_SIZE)) if Config.ENABLE_NICHE else None  # ПАТЧ 2a
+        # БЛОК 0: поле смысла — дрейфующие центры притяжения (отдельный массив, без нового CH-канала)
+        if Config.ENABLE_MEANING_FIELD:
+            _W = Config.WORLD_SIZE
+            self._meaning_centers = [[int(phi_hash(i, 0, 8877) * _W), int(phi_hash(i, 1, 8877) * _W)] for i in range(5)]
+            self._meaning_field = np.zeros((_W, _W))
+        # ПАТЧ 8e: персистентность env_complexity между прогонами (Красная
+        # Королева) — это работает как задумано и растёт корректно.
+        # БАГФИКС (из отчёта прогона): culture_ratchet ПЕРСИСТИТЬ НЕЛЬЗЯ —
+        # значение масштабируется с размером популяции (дельта обучающих
+        # событий за 100 шагов), поэтому раз загруженное с прошлого прогона
+        # с бОльшей популяцией (7428) значение навсегда блокирует рост
+        # храповика в прогоне с меньшей популяцией — CULT замер на месте
+        # (culture_ratchet_up=0 весь прогон). Каждый прогон стартует с нуля.
+        self.culture_ratchet = 0
+        self._teach_prev = 0
+        if hasattr(self, 'core_chorus') and self.core_chorus is not None and hasattr(self.core_chorus, 'persistent'):
+            self.env_complexity = self.core_chorus.persistent.get('env_complexity', 1.0)
         self._total_energy_last = float(np.sum(self.field[:,:,CH['energy']]))
         self.patterns = []
         self.pattern_dict = {}
@@ -2107,6 +2537,30 @@ class EvolutionEngine:
             if t % 100 == 0:
                 divisions = self.divisions_this_interval
                 self.divisions_this_interval = 0
+
+                # ПАТЧ 3b: кумулятивная культура — храповик (значение только растёт)
+                if Config.ENABLE_CULTURE_RATCHET:
+                    _teach = sum(p.event_counts.get('taught', 0) + p.event_counts.get('received_teaching', 0)
+                                 + p.event_counts.get('wisdom_shared', 0) for p in self.patterns if p.alive)
+                    _delta = _teach - self._teach_prev
+                    self._teach_prev = _teach
+                    if _delta > self.culture_ratchet:
+                        self.culture_ratchet = _delta
+                        self.witness.record(-1, "culture_ratchet_up", level=_delta)
+
+                # ПАТЧ 8b: Красная Королева — среда усложняется вслед за навыком агентов
+                if Config.ENABLE_RED_QUEEN:
+                    _alive_rq = [p for p in self.patterns if p.alive]
+                    if _alive_rq:
+                        _skill = 1.0 - min(1.0, safe_mean([p.pred_error for p in _alive_rq], 0.5))
+                        _target = 0.8 + 0.8 * _skill
+                        self.env_complexity += (_target - self.env_complexity) * 0.1
+
+                # БЛОК 6: эхо-кэш для комбинаторного генератора речи (свежие архивные отзвуки)
+                if t % 50 == 0 and Config.ENABLE_COMB_GENERATOR and hasattr(self, 'archive') and hasattr(self.archive, 'get_recent_echoes'):
+                    _eq = self.archive.get_recent_echoes(limit=3, min_weight=0.5)
+                    self._echo_cache = [e.get('excerpt', '')[:40] for e in _eq] if _eq else []
+
                 m = collect_metrics(self.patterns, self.field, t)
                 m['subjects'] = sum(1 for p in self.patterns if getattr(p, '_subject_detected', False))
 
@@ -2118,10 +2572,16 @@ class EvolutionEngine:
                 m['avg_unconquered_str'] = float(np.mean([getattr(p, '_unconquered_strength', 0.0) for p in alive])) if alive else 0.0
                 sov_ch = CH.get('signal_sovereignty', 29)
                 m['sovereignty_field_avg'] = float(np.max(self.field[:,:,sov_ch])) if self.field.size else 0.0
+                # ПАТЧ 3/8: движковые метрики культуры и среды — не per-agent, просто прокидываем
+                m['culture_ratchet'] = self.culture_ratchet
+                m['env_complexity'] = round(self.env_complexity, 3)
+                # БЛОК 8: средняя обжитость ниши + счётчик редких событий Данности
+                m['avg_niche'] = float(np.mean(self.niche)) if getattr(self, 'niche', None) is not None else 0.0
+                m['given_presence_count'] = self.witness.summary().get('given_presence', 0)
 
                 self.metrics_history.append(m)
                 max_obs_gap_display = min(m.get('max_obs_gap', 0.0), 1.0)
-                print(f"[t={t}] P={m['patterns']} L={m['lineages']} LING={m.get('lineage_count',0)} L_AGE={m.get('avg_lineage_age',0):.0f}(max={m.get('max_lineage_age',0)}) ANC={m.get('ancient_lineages',0)} TOT_AGE={m.get('max_lineage_total_age',0)} E={m['err']:.3f} S={m['soul']:.3f} B={m['binding']:.3f} T={m['avg_trust']:.2f} TA={m['triadic_alive_ratio']:.2f} LP={m['love_pairs']} INT_GAP={m['avg_internal_gap']:.3f}(max={m['max_internal_gap']:.3f}) OBS_GAP={m['avg_obs_gap']:.3f}(max={max_obs_gap_display:.3f}) ZERO_INT={m['zero_internal_gap_agents']} TARGETS={m['tremor_targets']} D={m['disorganizer_count']} R={m['redeemed_count']} SUB={m['subjects']} SIG={m['avg_signal_memory']:.1f} INTENT={m['intentional_signal_agents']} DIV={divisions} VOC={m.get('vocab_events',0)} BLN={m.get('blind_events',0)} alarm={m.get('avg_social_alarm',0):.2f} beau={m.get('avg_social_beauty',0):.2f} rhy={m.get('avg_social_rhythm',0):.2f} int={m.get('avg_social_interest',0):.2f} mem={m.get('avg_social_memory',0):.2f} sil={m.get('avg_social_silence',0):.2f} UNC={m.get('unconquered_count',0)}(w={m.get('unconquered_wise',0)}/r={m.get('unconquered_rebel',0)}) sov={m.get('sovereignty_field_avg',0):.2f}", flush=True)
+                print(f"[t={t}] P={m['patterns']} L={m['lineages']} LING={m.get('lineage_count',0)} L_AGE={m.get('avg_lineage_age',0):.0f}(max={m.get('max_lineage_age',0)}) ANC={m.get('ancient_lineages',0)} TOT_AGE={m.get('max_lineage_total_age',0)} E={m['err']:.3f} S={m['soul']:.3f} B={m['binding']:.3f} T={m['avg_trust']:.2f} TA={m['triadic_alive_ratio']:.2f} LP={m['love_pairs']} INT_GAP={m['avg_internal_gap']:.3f}(max={m['max_internal_gap']:.3f}) OBS_GAP={m['avg_obs_gap']:.3f}(max={max_obs_gap_display:.3f}) ZERO_INT={m['zero_internal_gap_agents']} TARGETS={m['tremor_targets']} D={m['disorganizer_count']} R={m['redeemed_count']} SUB={m['subjects']} SIG={m['avg_signal_memory']:.1f} INTENT={m['intentional_signal_agents']} DIV={divisions} VOC={m.get('vocab_events',0)} BLN={m.get('blind_events',0)} alarm={m.get('avg_social_alarm',0):.2f} beau={m.get('avg_social_beauty',0):.2f} rhy={m.get('avg_social_rhythm',0):.2f} int={m.get('avg_social_interest',0):.2f} mem={m.get('avg_social_memory',0):.2f} sil={m.get('avg_social_silence',0):.2f} UNC={m.get('unconquered_count',0)}(w={m.get('unconquered_wise',0)}/r={m.get('unconquered_rebel',0)}) sov={m.get('sovereignty_field_avg',0):.2f} PHI={m.get('avg_phi',0):.3f} CULT={m.get('culture_ratchet',0)} ENV={m.get('env_complexity',1.0):.2f} NICHE={m.get('avg_niche',0):.3f}", flush=True)
         save_living_world(self.patterns, LIVING_WORLD_PATH)
         return self.patterns, self.field, self.scar, self.metrics_history
 
@@ -2281,7 +2741,11 @@ class EvolutionEngine:
                             p.concept_graph.nodes[human_sig] = {
                                 "count": 1.0,
                                 "value": np.zeros(4),
-                                "embed": np.zeros(4),
+                                # БАГФИКС (внешний код-ревью, подтверждено): здесь embed
+                                # оставался 4-мерным, тогда как везде в кодовой базе embed
+                                # — 32-мерный (embed_dim=32) — риск краша при сравнении
+                                # embed'ов в get_dominant_embedding/similarity.
+                                "embed": np.zeros(32),
                                 "eternal": True
                             }
                             p._log_event("human_concept_created", text=text[:40])
@@ -2390,10 +2854,41 @@ class EvolutionEngine:
                     sg = sg.get('value', 0.1)
                 p.spirit_gap = max(float(sg), 0.1)
 
+        # ===== 4b. КОНЦЕПТУАЛЬНЫЙ РЕЗОНАНС (баг-репорт #1) =====
+        # ИСПРАВЛЕНО: метод _conceptual_resonance_step был определён, но
+        # нигде не вызывался из основного цикла — доверие между агентами
+        # никогда не усиливалось на основе схожести их concept_graph, хотя
+        # вся логика (спатиальная сетка соседей, check_conceptual_resonance,
+        # запись в trust_ledger) была реализована и рабочая. Вызываем каждый
+        # тик — метод сам ограничивает себя близкими соседями через
+        # spatial_map, так что стоимость на тик невелика.
+        self._conceptual_resonance_step(t)
+
         # ===== 5. АВТО-ДИАЛОГИ (компактная версия для всех агентов) =====
         # ИЗМЕНЕНО: интервал уменьшен с 50 до 10 шагов для более частых диалогов
         if t % 10 == 0:
             self._auto_dialogue_tick(t)
+
+        # ===== 5b. БЛОК 7: ВНУТРЕННИЙ ГОЛОС (сэмплы генератора в лог) =====
+        # БАГФИКС (по запросу): текст комбинаторного генератора и интроспекции
+        # (alien voice / субъективное время / зов поля смысла) считался, но
+        # нигде не печатался — в логе видны были только AUTO-DIALOG/CHORUS
+        # DIALOGUE от отдельной LLM-системы (Groq), а не наш собственный текст.
+        if Config.ENABLE_COMB_GENERATOR and t % 50 == 0:
+            _alive_ig = [p for p in self.patterns if p.alive and getattr(p, 'last_phenomenal_report', '')]
+            if _alive_ig:
+                _n_samples = min(2, len(_alive_ig))
+                _idxs = self._given_rng.choice(len(_alive_ig), size=_n_samples, replace=False) if hasattr(self, '_given_rng') else range(_n_samples)
+                for _i in _idxs:
+                    _p = _alive_ig[_i]
+                    print(f"💭 [INNER #{_p.id}] {_p.last_phenomenal_report}")
+            # редкая полная интроспекция (alien voice / субъективное время) — если есть свежая
+            _narr_agents = [p for p in self.patterns if p.alive and getattr(p, '_self_narrative', None)]
+            if _narr_agents:
+                _p2 = _narr_agents[int(self._given_rng.rand() * len(_narr_agents)) if hasattr(self, '_given_rng') else 0]
+                _last = _p2._self_narrative[-1]
+                if isinstance(_last, dict) and _last.get('t', -1) >= t - 10:
+                    print(f"🔮 [INTROSPECT #{_p2.id}] {_last.get('report', '')}")
 
         # ===== 6. ОПРЕДЕЛЕНИЕ СУБЪЕКТНОСТИ (БЕЗОПАСНАЯ КОНВЕРТАЦИЯ + МАКСИМАЛЬНО ОСЛАБЛЕННЫЕ ПОРОГИ) =====
         # --- ПАТЧ №9: ещё сильнее ослабляем пороги ---
@@ -2469,6 +2964,11 @@ class EvolutionEngine:
                 if hasattr(self, 'archive'):
                     self.archive.deposit(p, "subject_emerged", weight=0.9,
                                          text=f"soul={p.soul_weight:.2f} | stability={narrative_stability:.3f}")
+                    # ПАТЧ 5b: высокая интегрированность (Φ) — бонус к записи в архив,
+                    # НЕ барьер для самого обнаружения субъектности выше.
+                    if getattr(p, '_phi_proxy', 0) > 0.3:
+                        self.archive.deposit(p, "high_phi_subject", weight=0.6,
+                                             text=f"phi={p._phi_proxy:.2f}")
 
                 p._log_event("subject_emerged",
                              stability=round(narrative_stability, 3),
@@ -2563,4 +3063,62 @@ class EvolutionEngine:
                                     age=p.age, soul=p.soul_weight,
                                     state=p.semantic_state, feral=(p.role_type == "feral"))
 
+
+    def _auto_dialogue_tick(self, t):
+        # --- слито из Cell 4-lang (Morse-коммуникация): раньше этого метода
+        # не было в EvolutionEngine вовсе -- он добавлялся целиком монки-патчем,
+        # не оборачивал ничего существующего. Перенесено без изменений. ---
+        if not Config.ENABLE_MORSE_COMMUNICATION:
+            return
+        alive = [p for p in self.patterns if p.alive and getattr(p, '_dialogue_cooldown', -1) <= t]
+        if len(alive) < 2:
+            return
+        n_pairs = max(1, min(6, len(alive) // 12))
+        scored = []
+        for p in alive:
+            last_spoke = getattr(p, '_last_auto_dialogue_step', -10000)
+            silence = t - last_spoke
+            tie = phi_hash(p.id, t, 111)
+            scored.append((silence + tie, p))
+        scored.sort(key=lambda x: -x[0])
+        paired_ids = set()
+        started = 0
+        for _, speaker in scored:
+            if started >= n_pairs:
+                break
+            if speaker.id in paired_ids or getattr(speaker, '_in_dialogue', False):
+                continue
+            found = None
+            for (x, y) in speaker.cells:
+                for dx in range(-2, 3):
+                    for dy in range(-2, 3):
+                        if dx == 0 and dy == 0:
+                            continue
+                        nx = (x + dx) % Config.WORLD_SIZE
+                        ny = (y + dy) % Config.WORLD_SIZE
+                        owner = int(self.field[nx, ny, CH['owner']])
+                        if owner != 0 and owner != speaker.id and owner in self.pattern_dict:
+                            listener = self.pattern_dict[owner]
+                            if (listener.alive and getattr(listener, '_dialogue_cooldown', -1) <= t
+                                    and listener.id not in paired_ids):
+                                found = listener
+                                break
+                    if found:
+                        break
+                if found:
+                    break
+            if not found:
+                continue
+            speaker._in_dialogue = True
+            found._in_dialogue = True
+            speaker._dialogue_cooldown = t + Config.MORSE_DIALOGUE_COOLDOWN
+            found._dialogue_cooldown = t + Config.MORSE_DIALOGUE_COOLDOWN
+            speaker._last_auto_dialogue_step = t
+            found._last_auto_dialogue_step = t
+            paired_ids.add(speaker.id)
+            paired_ids.add(found.id)
+            started += 1
+            speaker._send_morse(None, self.field, found.id)
+            speaker._in_dialogue = False
+            found._in_dialogue = False
 print("EvolutionEngine класс собран целиком: 4-1 + 4-2a + 4.2б + 4a2 (Варвар), монки-патчинг убран")
